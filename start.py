@@ -2,6 +2,11 @@ import requests
 import json
 import re
 from bs4 import BeautifulSoup
+import os
+import unicodedata
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime
 
 # URL to fetch
 url = 'https://www.nepalichristiansongs.net/songs/script/list.js'
@@ -17,11 +22,72 @@ headers = {
     'Referer': 'https://www.nepalichristiansongs.net/',
 }
 
+# Add this at the top level of the script, outside any function
+song_counter = 1
+
+# Database configuration
+DB_CONFIG = {
+    'dbname': 'song',
+    'user': 'postgres',
+    'password': '1234',
+    'host': 'localhost',
+    'port': '5432'
+}
+
+def get_db_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS songs (
+                song_id VARCHAR(50) PRIMARY KEY,
+                title TEXT NOT NULL,
+                url TEXT,
+                lyrics TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+    except psycopg2.Error as e:
+        print(f"Database error: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+def save_to_db(song_data):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute('''
+            INSERT INTO songs (song_id, title, url, lyrics)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (song_id) 
+            DO UPDATE SET 
+                title = EXCLUDED.title,
+                url = EXCLUDED.url,
+                lyrics = EXCLUDED.lyrics
+        ''', (
+            song_data['song_id'],
+            song_data['title'],
+            song_data['url'],
+            song_data['lyrics']
+        ))
+        conn.commit()
+        print(f"Saved to database: {song_data['song_id']} - {song_data['title']}")
+    except psycopg2.Error as e:
+        print(f"Database error: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
 def remove_html_tags(text):
     clean = re.compile('<.*?>')
     return re.sub(clean, '', text)
 
-def extractVerse(script_tag):
+def extract_verse(script_tag):
     if script_tag:
         script_content = script_tag.string
 
@@ -42,63 +108,126 @@ def extractVerse(script_tag):
         print("No <script> tag found.")
         return []
 
-
-def getSong(song):
+def get_song(song):
+    global song_counter
     url = baseurl + song + '.html'
-    # Send a GET request to the URL with headers
     response = requests.get(url, headers=headers)
-
-    # Check if the request was successful
+    
     if response.status_code == 200:
-        # Load the content into a variable
-        list_js_content = remove_html_tags(response.text)
+        response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Extract the JavaScript code from the <script> tag
-        script_tag = soup.find('script')
         head_tag = soup.find('center')
 
-        # Initialize a list to hold the extracted content
-        content = []
+        # Initialize variables
+        title = ''
+        song_id = ''
 
-        # Iterate through the tags of interest, including <hr>
-        for tag in head_tag.find_all(['div', 'span']):
-            # Extract the text and strip any leading/trailing whitespace
-            tag_text = tag.get_text(strip=True) if tag.name != 'hr' else '<hr>'
+        # Extract song title and ID
+        title_element = song
+        if title_element:
+            full_title = title_element.strip()
+            print(f"Debug - Full title: {full_title}")  # Debug print
             
-            # Handle the case where multiple &nbsp; should be replaced by a single new line
+            # Try to find ID in the title (now including letters after numbers)
+            match = re.search(r'(.*?)\s*-\s*([bcBC]\d+[a-zA-Z]*)\s*-?\s*(?:mp3)?', full_title)
+            if match:
+                title = match.group(1).strip()
+                song_id = match.group(2).lower()
+                print(f"Debug - Found ID: {song_id}, Title: {title}")  # Debug print
+            else:
+                # No ID found, use incremental counter and full title
+                title = full_title.split('-mp3')[0].strip()  # Remove -mp3 if present
+                song_id = f'o{song_counter}'
+                song_counter += 1
+                print(f"Debug - Using counter: {song_id}, Title: {title}")  # Debug print
+        
+        # Fallback if title is still empty
+        if not title or not song_id:
+            title = song.split('-mp3')[0].strip()  # Use the original song parameter
+            song_id = song.split('-mp3')[1].strip()
+            song_counter += 1
+            print(f"Debug - Fallback: {song_id}, Title: {title}")  # Debug print
+
+        content = []
+        for tag in head_tag.find_all(['div', 'span']):
+            tag_text = tag.get_text(strip=True) if tag.name != 'hr' else '<hr>'
+            tag_text = unicodedata.normalize('NFKC', tag_text)
+            
             if tag_text == '' and tag.name == 'div': 
                 if not content or content[-1] != '\n':
                     content.append('\n')
             elif tag_text != '&nbsp;' and tag_text != '':
                 content.append(tag_text)
 
-        print(content)
-        # extractVerse(script_tag)
-
-        # python_list = json.loads(list_js_content)
-        # print(python_list)
+        formatted_content = {
+            'song_id': song_id,
+            'title': title,
+            'url': url,
+            'lyrics': '\n'.join(content)
+        }
+        
+        # Save to database
+        save_to_db(formatted_content)
+        
+        return formatted_content
     else:
         print(f"Failed to retrieve the content. Status code: {response.status_code}")
+        return None
 
+# Example query functions
+def get_all_songs():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT song_id, title FROM songs ORDER BY created_at")
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+def get_song_by_id(song_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT * FROM songs WHERE song_id = %s", (song_id,))
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+def search_songs(search_term):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT * FROM songs 
+            WHERE title ILIKE %s OR lyrics ILIKE %s
+        """, (f'%{search_term}%', f'%{search_term}%'))
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+# Main script
 try:
-    # Send a GET request to the URL with headers
+    # Initialize the database
+    init_db()
+    
     response = requests.get(url, headers=headers)
-
-    # Check if the request was successful
     if response.status_code == 200:
-        # Load the content into a variable
         list_js_content = response.text.replace("var songList = ","")
         python_list = json.loads(list_js_content)
+        
+        successful_songs = 0
         for sng in python_list:
-            getSong(sng)
-        print(python_list)
+            song_data = get_song(sng)
+            if song_data:
+                successful_songs += 1
+            
+        print(f"Successfully saved {successful_songs} songs to database")
     else:
         print(f"Failed to retrieve the content. Status code: {response.status_code}")
 
-except requests.RequestException as e:
-    # Print any error that occurs
+except Exception as e:
     print(f"An error occurred: {e}")
-except json.JSONDecodeError as e:
-    print(f"Failed to parse JSON: {e}")
 
