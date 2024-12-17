@@ -7,6 +7,10 @@ import unicodedata
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
+import concurrent.futures
+import threading
+from queue import Queue
+import psycopg2.pool
 
 # URL to fetch
 url = 'https://www.nepalichristiansongs.net/songs/script/list.js'
@@ -34,8 +38,25 @@ DB_CONFIG = {
     'port': '5432'
 }
 
+# Thread-safe connection pool
+db_pool = psycopg2.pool.SimpleConnectionPool(
+    minconn=1,
+    maxconn=20,  # Adjust based on your needs
+    **DB_CONFIG
+)
+
+# Thread-local storage for database connections
+thread_local = threading.local()
+
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
+    try:
+        return db_pool.getconn()
+    except psycopg2.pool.PoolError:
+        print("Waiting for available database connection...")
+        return db_pool.getconn()
+
+def return_db_connection(conn):
+    db_pool.putconn(conn)
 
 def init_db():
     conn = get_db_connection()
@@ -55,7 +76,7 @@ def init_db():
         print(f"Database error: {e}")
     finally:
         cur.close()
-        conn.close()
+        return_db_connection(conn)
 
 def save_to_db(song_data):
     conn = get_db_connection()
@@ -81,7 +102,7 @@ def save_to_db(song_data):
         print(f"Database error: {e}")
     finally:
         cur.close()
-        conn.close()
+        return_db_connection(conn)
 
 def remove_html_tags(text):
     clean = re.compile('<.*?>')
@@ -108,7 +129,7 @@ def extract_verse(script_tag):
         print("No <script> tag found.")
         return []
 
-def get_song(song):
+def get_song(song, progress_tracker=None):
     global song_counter
     url = baseurl + song + '.html'
     response = requests.get(url, headers=headers)
@@ -166,8 +187,8 @@ def get_song(song):
             'lyrics': '\n'.join(content)
         }
         
-        # Save to database
-        save_to_db(formatted_content)
+        if progress_tracker:
+            progress_tracker.increment()
         
         return formatted_content
     else:
@@ -183,7 +204,7 @@ def get_all_songs():
         return cur.fetchall()
     finally:
         cur.close()
-        conn.close()
+        return_db_connection(conn)
 
 def get_song_by_id(song_id):
     conn = get_db_connection()
@@ -193,7 +214,7 @@ def get_song_by_id(song_id):
         return cur.fetchone()
     finally:
         cur.close()
-        conn.close()
+        return_db_connection(conn)
 
 def search_songs(search_term):
     conn = get_db_connection()
@@ -206,28 +227,109 @@ def search_songs(search_term):
         return cur.fetchall()
     finally:
         cur.close()
-        conn.close()
+        return_db_connection(conn)
 
-# Main script
-try:
-    # Initialize the database
-    init_db()
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        list_js_content = response.text.replace("var songList = ","")
-        python_list = json.loads(list_js_content)
+def process_song(song):
+    try:
+        song_data = get_song(song)
+        if song_data:
+            save_to_db(song_data)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error processing song {song}: {e}")
+        return False
+
+def batch_save_to_db(songs_batch):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        args = [(
+            song['song_id'],
+            song['title'],
+            song['url'],
+            song['lyrics']
+        ) for song in songs_batch]
         
-        successful_songs = 0
-        for sng in python_list:
-            song_data = get_song(sng)
-            if song_data:
-                successful_songs += 1
-            
-        print(f"Successfully saved {successful_songs} songs to database")
-    else:
-        print(f"Failed to retrieve the content. Status code: {response.status_code}")
+        cur.executemany('''
+            INSERT INTO songs (song_id, title, url, lyrics)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (song_id) 
+            DO UPDATE SET 
+                title = EXCLUDED.title,
+                url = EXCLUDED.url,
+                lyrics = EXCLUDED.lyrics
+        ''', args)
+        
+        conn.commit()
+        print(f"Saved batch of {len(songs_batch)} songs")
+    except psycopg2.Error as e:
+        print(f"Database error in batch save: {e}")
+    finally:
+        cur.close()
+        return_db_connection(conn)
 
-except Exception as e:
-    print(f"An error occurred: {e}")
+def process_batch(songs_batch):
+    results = []
+    for song in songs_batch:
+        try:
+            song_data = get_song(song)
+            if song_data:
+                results.append(song_data)
+        except Exception as e:
+            print(f"Error processing song {song}: {e}")
+    
+    if results:
+        batch_save_to_db(results)
+    return len(results)
+
+def main_with_batching():
+    try:
+        init_db()
+        
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            list_js_content = response.text.replace("var songList = ","")
+            python_list = json.loads(list_js_content)
+            
+            # Create batches of songs
+            batch_size = 10
+            batches = [python_list[i:i + batch_size] for i in range(0, len(python_list), batch_size)]
+            
+            successful_songs = 0
+            
+            # Process batches with ThreadPoolExecutor
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_batch = {executor.submit(process_batch, batch): batch for batch in batches}
+                
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    successful_songs += future.result()
+            
+            print(f"Processing complete. Successfully saved: {successful_songs} songs")
+        else:
+            print(f"Failed to retrieve the content. Status code: {response.status_code}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        db_pool.closeall()
+
+# Progress tracking
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self.lock = threading.Lock()
+        
+    def increment(self):
+        with self.lock:
+            self.current += 1
+            self.print_progress()
+    
+    def print_progress(self):
+        percentage = (self.current / self.total) * 100
+        print(f"Progress: {self.current}/{self.total} ({percentage:.1f}%)")
+
+if __name__ == "__main__":
+    main_with_batching()
 
