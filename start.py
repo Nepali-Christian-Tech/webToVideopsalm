@@ -31,7 +31,7 @@ song_counter = 1
 
 # Database configuration
 DB_CONFIG = {
-    'dbname': 'song',
+    'dbname': 'song_update',
     'user': 'postgres',
     'password': '1234',
     'host': 'localhost',
@@ -41,7 +41,7 @@ DB_CONFIG = {
 # Thread-safe connection pool
 db_pool = psycopg2.pool.SimpleConnectionPool(
     minconn=1,
-    maxconn=20,  # Adjust based on your needs
+    maxconn=40,  # Adjust based on your needs
     **DB_CONFIG
 )
 
@@ -68,6 +68,7 @@ def init_db():
                 title TEXT NOT NULL,
                 url TEXT,
                 lyrics TEXT,
+                lyrics_eng TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -83,18 +84,20 @@ def save_to_db(song_data):
     cur = conn.cursor()
     try:
         cur.execute('''
-            INSERT INTO songs (song_id, title, url, lyrics)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO songs (song_id, title, url, lyrics, lyrics_eng)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (song_id) 
             DO UPDATE SET 
                 title = EXCLUDED.title,
                 url = EXCLUDED.url,
-                lyrics = EXCLUDED.lyrics
+                lyrics = EXCLUDED.lyrics,
+                lyrics_eng = EXCLUDED.lyrics_eng
         ''', (
             song_data['song_id'],
             song_data['title'],
             song_data['url'],
-            song_data['lyrics']
+            song_data['lyrics'],
+            song_data['lyrics_eng']
         ))
         conn.commit()
         print(f"Saved to database: {song_data['song_id']} - {song_data['title']}")
@@ -170,21 +173,31 @@ def get_song(song, progress_tracker=None):
             print(f"Debug - Fallback: {song_id}, Title: {title}")  # Debug print
 
         content = []
+        content_eng = []
         for tag in head_tag.find_all(['div', 'span']):
             tag_text = tag.get_text(strip=True) if tag.name != 'hr' else '<hr>'
+            tag_class = tag.get("class")
             tag_text = unicodedata.normalize('NFKC', tag_text)
             
             if tag_text == '' and tag.name == 'div': 
                 if not content or content[-1] != '\n':
                     content.append('\n')
+                    content_eng.append('\n')
             elif tag_text != '&nbsp;' and tag_text != '':
-                content.append(tag_text)
-
+                if "nepali" in tag_class:
+                    content.append(tag_text)
+                else:
+                    pattern = r'^(Chorus|Verse|Ending)\s*(\d+)?(?::|$)'
+                    match = re.match(pattern, tag_text)
+                    if match:
+                        content.append(tag_text)
+                    content_eng.append(tag_text)
         formatted_content = {
             'song_id': song_id,
             'title': title,
             'url': url,
-            'lyrics': '\n'.join(content)
+            'lyrics': '\n'.join(content),
+            'lyrics_eng': '\n'.join(content_eng)
         }
         
         if progress_tracker:
@@ -248,17 +261,19 @@ def batch_save_to_db(songs_batch):
             song['song_id'],
             song['title'],
             song['url'],
-            song['lyrics']
+            song['lyrics'],
+            song['lyrics_eng']
         ) for song in songs_batch]
         
         cur.executemany('''
-            INSERT INTO songs (song_id, title, url, lyrics)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO songs (song_id, title, url, lyrics, lyrics_eng)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (song_id) 
             DO UPDATE SET 
                 title = EXCLUDED.title,
                 url = EXCLUDED.url,
-                lyrics = EXCLUDED.lyrics
+                lyrics = EXCLUDED.lyrics,
+                lyrics_eng = EXCLUDED.lyrics_eng
         ''', args)
         
         conn.commit()
@@ -293,7 +308,7 @@ def main_with_batching():
             python_list = json.loads(list_js_content)
             
             # Create batches of songs
-            batch_size = 10
+            batch_size = 20
             batches = [python_list[i:i + batch_size] for i in range(0, len(python_list), batch_size)]
             
             successful_songs = 0
